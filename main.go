@@ -1,180 +1,191 @@
 package main
 
 import (
-	"errors"
-	"fmt"
-	"strings"
-	"sync"
+    "errors"
+    "strings"
+    "sync"
 )
 
 type Player struct {
-	name    string
-	mapID   int
-	channel chan string
-	game    *Game
-	mu      sync.RWMutex
+    name       string
+    currentMap *Map
+    msgChan    chan string
+    mu         sync.RWMutex
 }
 
 type Map struct {
-	id       int
-	players  map[string]*Player
-	messages chan string
-	mu       sync.RWMutex
+    id      int
+    players map[string]*Player
+    msgChan chan string
+    mu      sync.RWMutex
 }
 
 type Game struct {
-	players map[string]*Player
-	maps    map[int]*Map
-	mu      sync.RWMutex
+    maps    map[int]*Map
+    players map[string]*Player
+    mu      sync.RWMutex
 }
 
 func NewGame(mapIds []int) (*Game, error) {
-	game := &Game{
-		players: make(map[string]*Player),
-		maps:    make(map[int]*Map),
-	}
+    for _, id := range mapIds {
+        if id <= 0 {
+            return nil, errors.New("map id must be positive")
+        }
+    }
 
-	for _, id := range mapIds {
-		if id <= 0 {
-			return nil, errors.New("map ID must be greater than 0")
-		}
-		game.maps[id] = &Map{
-			id:       id,
-			players:  make(map[string]*Player),
-			messages: make(chan string, 100),
-			mu:       sync.RWMutex{},
-		}
-		go game.maps[id].FanOutMessages()
-	}
-	return game, nil
+    game := &Game{
+        maps:    make(map[int]*Map),
+        players: make(map[string]*Player),
+    }
+
+    for _, id := range mapIds {
+        m := &Map{
+            id:      id,
+            players: make(map[string]*Player),
+            msgChan: make(chan string, 100),
+        }
+        game.maps[id] = m
+        go m.FanOutMessages()
+    }
+
+    return game, nil
 }
 
 func (g *Game) ConnectPlayer(name string) error {
-	loweredName := strings.ToLower(name)
-	
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	
-	if _, exists := g.players[loweredName]; exists {
-		return errors.New("player name already exists")
-	}
+    if name == "" {
+        return errors.New("player name cannot be empty")
+    }
 
-	player := &Player{
-		name:    name,
-		channel: make(chan string, 100),
-		mapID:   0,
-		game:    g,
-		mu:      sync.RWMutex{},
-	}
+    normalizedName := strings.ToLower(name)
+    
+    g.mu.Lock()
+    if _, exists := g.players[normalizedName]; exists {
+        g.mu.Unlock()
+        return errors.New("player already exists")
+    }
 
-	g.players[loweredName] = player
-	return nil
+    player := &Player{
+        name:    name,
+        msgChan: make(chan string, 100),
+    }
+    g.players[normalizedName] = player
+    g.mu.Unlock()
+    
+    return nil
 }
 
 func (g *Game) SwitchPlayerMap(name string, mapId int) error {
-	g.mu.RLock()
-	player, exists := g.players[strings.ToLower(name)]
-	if !exists {
-		g.mu.RUnlock()
-		return errors.New("player not found")
-	}
-	targetMap, mapExists := g.maps[mapId]
-	if !mapExists {
-		g.mu.RUnlock()
-		return errors.New("map does not exist")
-	}
-	g.mu.RUnlock()
+    normalizedName := strings.ToLower(name)
+    
+    g.mu.RLock()
+    player, exists := g.players[normalizedName]
+    if !exists {
+        g.mu.RUnlock()
+        return errors.New("player not found")
+    }
 
-	player.mu.Lock()
-	if player.mapID == mapId {
-		player.mu.Unlock()
-		return errors.New("player is already in this map")
-	}
+    newMap, exists := g.maps[mapId]
+    if !exists {
+        g.mu.RUnlock()
+        return errors.New("map not found")
+    }
+    g.mu.RUnlock()
 
-	oldMapID := player.mapID
-	player.mapID = mapId
-	player.mu.Unlock()
+    player.mu.Lock()
+    oldMap := player.currentMap
+    if oldMap != nil {
+        if oldMap.id == mapId {
+            player.mu.Unlock()
+            return errors.New("player already in this map")
+        }
+    }
 
-	if oldMapID != 0 {
-		oldMap := g.maps[oldMapID]
-		oldMap.mu.Lock()
-		delete(oldMap.players, strings.ToLower(name))
-		oldMap.mu.Unlock()
-	}
+    // First update the player's map reference
+    player.currentMap = newMap
+    player.mu.Unlock()
 
-	targetMap.mu.Lock()
-	targetMap.players[strings.ToLower(name)] = player
-	targetMap.mu.Unlock()
+    // Then handle the map players' lists
+    if oldMap != nil {
+        oldMap.mu.Lock()
+        delete(oldMap.players, normalizedName)
+        oldMap.mu.Unlock()
+    }
 
-	return nil
+    newMap.mu.Lock()
+    newMap.players[normalizedName] = player
+    newMap.mu.Unlock()
+
+    return nil
 }
 
 func (g *Game) GetPlayer(name string) (*Player, error) {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+    g.mu.RLock()
+    defer g.mu.RUnlock()
 
-	player, exists := g.players[strings.ToLower(name)]
-	if !exists {
-		return nil, errors.New("player not found")
-	}
-	return player, nil
+    if player, exists := g.players[strings.ToLower(name)]; exists {
+        return player, nil
+    }
+    return nil, errors.New("player not found")
 }
 
 func (g *Game) GetMap(mapId int) (*Map, error) {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+    g.mu.RLock()
+    defer g.mu.RUnlock()
 
-	m, exists := g.maps[mapId]
-	if !exists {
-		return nil, errors.New("map not found")
-	}
-	return m, nil
+    if m, exists := g.maps[mapId]; exists {
+        return m, nil
+    }
+    return nil, errors.New("map not found")
 }
 
 func (m *Map) FanOutMessages() {
-	for msg := range m.messages {
-		m.mu.RLock()
-		for _, player := range m.players {
-			select {
-			case player.channel <- msg:
-			default:
-				// Channel is full, skip this message
-			}
-		}
-		m.mu.RUnlock()
-	}
+    for msg := range m.msgChan {
+        m.mu.RLock()
+        currentPlayers := make(map[string]*Player)
+        for name, player := range m.players {
+            currentPlayers[name] = player
+        }
+        m.mu.RUnlock()
+
+        parts := strings.SplitN(msg, " says: ", 2)
+        senderName := strings.ToLower(strings.TrimSpace(parts[0]))
+
+        for name, player := range currentPlayers {
+            if name != senderName {
+                select {
+                case player.msgChan <- msg:
+                default:
+                    // Skip if channel is full
+                }
+            }
+        }
+    }
 }
 
 func (p *Player) GetChannel() <-chan string {
-	return p.channel
+    return p.msgChan
 }
 
 func (p *Player) SendMessage(msg string) error {
-	p.mu.RLock()
-	currentMapID := p.mapID
-	p.mu.RUnlock()
+    p.mu.RLock()
+    currentMap := p.currentMap
+    p.mu.RUnlock()
 
-	if currentMapID == 0 {
-		return errors.New("player is not in any map")
-	}
+    if currentMap == nil {
+        return errors.New("player not in any map")
+    }
 
-	p.game.mu.RLock()
-	m, exists := p.game.maps[currentMapID]
-	p.game.mu.RUnlock()
+    formattedName := strings.Title(strings.ToLower(p.name))
+    formattedMsg := formattedName + " says: " + msg
 
-	if !exists {
-		return errors.New("map not found")
-	}
-
-	formattedMsg := fmt.Sprintf("%s says: %s", strings.Title(strings.ToLower(p.name)), msg)
-	select {
-	case m.messages <- formattedMsg:
-		return nil
-	default:
-		return errors.New("message channel is full")
-	}
+    select {
+    case currentMap.msgChan <- formattedMsg:
+        return nil
+    default:
+        return errors.New("message channel is full")
+    }
 }
 
 func (p *Player) GetName() string {
-	return p.name
+    return p.name
 }
